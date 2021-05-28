@@ -2,4 +2,10 @@ tensorflow-gpu==2.3.1
 scipy
 nose
 mock
-librosa
+librosa==0.7.1
+numba==0.47.0
+llvmlite==0.31.0
+pyinstaller
+opencv-python
+scikit-learn==0.22.1
+git+git://github.com/hwp/apkit.git

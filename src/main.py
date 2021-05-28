@@ -5,16 +5,20 @@ import os
 import time
 import yarp
 import numpy as np
-
+import cv2
 from utils import *
+import scipy.io.wavfile as wavfile
 
 
 def info(msg):
     print("[INFO] {}".format(msg))
 
 
-SOUND_SOURCE_LABEL = ["left", "center", "right", "background"]
+SOUND_SOURCE_LABEL_BARRY = ["right", "center", "left", "background"]
+SOUND_SOURCE_LABEL_REDDY = ["left", "center", "right", "background"]
 
+physical_devices = tf.config.list_physical_devices('GPU')
+tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 
 class SoundLocalizerModule(yarp.RFModule):
@@ -36,6 +40,7 @@ class SoundLocalizerModule(yarp.RFModule):
 
         # Define vars to receive audio
         self.audio_in_port = None
+        self.audio_power_port = yarp.Port()
 
         # Define port to control the head motion
         self.head_motorOutputPort = None
@@ -47,12 +52,12 @@ class SoundLocalizerModule(yarp.RFModule):
         # Module parameters
         self.model_path = None
         self.model = None
-        self.process = False
+        self.process = True
         self.threshold = None
         self.length_input = None
         self.counter_label = 1
 
-        self.current_azimuth_angle = None
+        self.current_azimuth_angle = 0
         self.previous_label = -1
 
         self.label_history = []
@@ -64,11 +69,19 @@ class SoundLocalizerModule(yarp.RFModule):
         self.np_audio = None
         self.nb_samples_received = 0
         self.sampling_rate = None
+        self.threshold_voice = None
 
         # Parameters head motion
         self.head_limit = None
-        self.head_motion = {0: -80, 1: 0, 2: 80}
+        self.head_motion = {0: 15, 1: 0, 2: -15}
 
+        # Visualisation
+        self.visualisation_port = yarp.Port()
+        self.display_buf_array = None
+        self.display_buf_image = yarp.ImageRgb()
+        self.output_img_width = None
+        self.output_img_height = None
+        self.output_frame = None
 
     def configure(self, rf):
 
@@ -85,7 +98,7 @@ class SoundLocalizerModule(yarp.RFModule):
 
         # Module parameters
         self.module_name = rf.check("name",
-                                    yarp.Value("SoundLocalizer"),
+                                    yarp.Value("SoundLocaliser"),
                                     "module name (string)").asString()
 
         self.model_path = rf.check("model_path",
@@ -94,20 +107,23 @@ class SoundLocalizerModule(yarp.RFModule):
                                    "Model path (.h5) (string)").asString()
 
         self.length_input = rf.check("length_input",
-                                     yarp.Value(2),
+                                     yarp.Value(1),
                                      "length input in seconds (int)").asInt()
 
         self.threshold = rf.check("threshold",
-                                  yarp.Value(0.35),
+                                  yarp.Value(0.20),
                                   "threshold for detection (double)").asDouble()
 
         self.sampling_rate = rf.check("fs",
-                                      yarp.Value(48000),
+                                      yarp.Value(0),
                                       " Sampling rate of the incoming audio signal (int)").asInt()
 
         self.head_limit = rf.check("azimuth_limit",
                                       yarp.Value(60),
                                       "Positive max azimuth  angle  (int)").asInt()
+
+        self.path_img_template = rf.check("template_path", yarp.Value("../app/conf/template_img.png"),
+                                          'Path of  image template').asString()
 
         # Opening Ports
         # Create handle port to read message
@@ -115,16 +131,38 @@ class SoundLocalizerModule(yarp.RFModule):
 
         # Audio
         self.audio_in_port.open('/' + self.module_name + '/audio:i')
+        self.audio_power_port.open('/' + self.module_name + '/power:i')
 
         # Motor
         self.head_motorOutputPort.open('/' + self.module_name + '/angle:o')
         self.head_motorInputPort.open('/' + self.module_name + '/angle:i')
         self.events_Port.open('/' + self.module_name + '/events:o')
 
+        # Visualisation
+        self.visualisation_port.open('/' + self.module_name + '/image:o')
+        self.template = cv2.imread(self.path_img_template)
+
+        self.output_img_width = self.template.shape[1]
+        self.output_img_height = self.template.shape[0]
+        self.output_frame = np.zeros((self.output_img_height, self.output_img_width, 3), dtype=np.uint8)
+
+        self.display_buf_image.resize(self.output_img_width, self.output_img_height)
+        self.display_buf_array = np.zeros((self.output_img_height, self.output_img_width, 3),
+                                                 dtype=np.uint8).tobytes()
+        self.display_buf_image.setExternal(self.display_buf_array, self.output_img_width,
+                                                  self.output_img_height)
+
+        self.threshold_voice = rf.check("voice_threshold",
+                                        yarp.Value("4"),
+                                        "Energy threshold use by the VAD (int)").asDouble()
+
         try:
             self.model = tf.keras.models.load_model(self.model_path)
-        except Exception:
+
+        except Exception as e:
+            print(e)
             print("[ERROR] Cannot open the model check if the path is right {}".format(self.model_path))
+
             return False
 
         self.model.summary()
@@ -141,6 +179,7 @@ class SoundLocalizerModule(yarp.RFModule):
         self.head_motorInputPort.interrupt()
         self.handle_port.interrupt()
         self.events_Port.interrupt()
+        self.visualisation_port.interrupt()
 
         return True
 
@@ -150,6 +189,7 @@ class SoundLocalizerModule(yarp.RFModule):
         self.head_motorOutputPort.close()
         self.head_motorInputPort.close()
         self.events_Port.close()
+        self.visualisation_port.close()
 
         return True
 
@@ -213,23 +253,46 @@ class SoundLocalizerModule(yarp.RFModule):
 
             self.audio.append(chunk)
 
+            return True
+        return False
+
     def get_angle_head(self):
-        bottle_angle = self.head_motorInputPort(False)
+        bottle_angle = self.head_motorInputPort.read(False)
         if bottle_angle:
             self.current_azimuth_angle = bottle_angle.get(0).asInt()
 
+    def get_power(self):
+        max_power = 0.0
+        if self.audio_power_port.getInputCount():
+
+            power_matrix = yarp.Matrix()
+            self.audio_power_port.read(power_matrix)
+            power_values = [power_matrix[0, 1], power_matrix[0, 0]]
+            max_power = np.max(power_values)
+            # info("Max power is {}".format(max_power))
+
+        return max_power
+
+
     def updateModule(self):
 
-        if self.process:
+        self.record_audio()
+        audio_power = self.get_power()
+
+        if self.process and audio_power > self.threshold_voice:
+            self.audio = self.audio[-1:]
             self.get_angle_head()
-            self.record_audio()
 
             if self.nb_samples_received >= self.length_input * self.sound.getFrequency():
                 audio_signal = format_signal(self.audio)
-                angle_predicted, score = self.get_sound_source(audio_signal)
+                fs = self.sound.getFrequency()
+                wavfile.write("/tmp/recording.wav", fs, audio_signal)
+                # sf.write("/tmp/recording.wav", audio_signal, self.sound.getSamples())
+
+                angle_predicted, score = self.get_sound_source()
 
                 # Detected a voice
-                if angle_predicted and score > self.threshold:
+                if angle_predicted is not None and score > self.threshold:
 
                     if angle_predicted == self.previous_label:
                         self.counter_label += 1
@@ -239,21 +302,26 @@ class SoundLocalizerModule(yarp.RFModule):
                     self.previous_label = angle_predicted
                     self.label_history.append(angle_predicted)
 
-                    has_converged = self.inferFinalPose()
+                    has_converged, azimuth = self.inferFinalPose()
 
                     if has_converged:
                         self.label_history = []
                         self.counter_label = 1
                         # self.process = False
-                        self.sendEvent("sound-convergence")
-                        azimuth = self.head_limit if angle_predicted == 0 else -self.head_limit
+                        self.sendEvent("sound-localised")
                         elevation = 10
                     else:
                         azimuth, elevation = self.getMotorCommand(angle_predicted)
 
                     self.send_head_motion(azimuth, elevation)
 
+                    if self.visualisation_port.getOutputCount():
+                        frame = self.template.copy()
+                        self.output_frame = self.draw_sound_vis(frame, self.head_motion[angle_predicted])
+                        self.write_image_vis(self.output_frame)
+
                 self.audio = []
+                self.nb_samples_received = 0
 
         return True
 
@@ -261,7 +329,8 @@ class SoundLocalizerModule(yarp.RFModule):
         motor_command_bottle = yarp.Bottle()
         motor_command_bottle.clear()
 
-        if self.head_motorOutputPort.getOutputCount() and azimuth and elevation:
+        if self.head_motorOutputPort.getOutputCount() and \
+                azimuth is not None and elevation is not None:
             motor_command_bottle.addString("abs")
             motor_command_bottle.addDouble(azimuth)
             motor_command_bottle.addDouble(elevation)
@@ -281,38 +350,44 @@ class SoundLocalizerModule(yarp.RFModule):
             return True
         return False
 
-    def get_sound_source(self, signal):
+    def get_sound_source(self):
+        fs, signal = wavfile.read('/tmp/recording.wav')
+        signal = signal[:48000, :]
 
-        fft_gram1, fft_gram2 = get_fft_gram(signal)
-        input_x = np.stack((fft_gram1[:, :144], fft_gram2[:, :144]), axis=-1)
-        input_x = np.expand_dims(input_x, axis=0)
+        fft_gram_right, fft_gram_left = get_fft_gram(signal, fs=fs, time_window=0.015, channels=128, freq_min=120)
+        feat = format_input_channels(fft_gram_right, fft_gram_left)
 
-        y_pred = self.model.predict(input_x)
+        # feat = get_fbanks_gcc(signal, 48000,  win_size=1024, hop_size=512, nfbank=50)
+
+        y_pred = self.model.predict(feat)
         angle_pred = np.argmax(y_pred)
+        confidence = round(y_pred[0][angle_pred], 2)
 
         if angle_pred == 3:
             print("Background detected")
             return None, None
 
-        print(f"Sound source predicted  {SOUND_SOURCE_LABEL[angle_pred]}")
-        return angle_pred, y_pred[0][angle_pred]
+        print(f"Sound source predicted  {SOUND_SOURCE_LABEL_BARRY[angle_pred]} with {confidence*100}% confidence")
+        return angle_pred, confidence
 
     def inferFinalPose(self):
         position_found = False
-
+        azimuth = self.current_azimuth_angle
         if self.label_history[-2:].count(1) == 2:
             info(f"Final pose found")
             position_found = True
 
-        elif self.label_history[-4:].count(2) == 4:
-            info(f"Final pose found")
-            position_found = True
+        # elif self.label_history[-4:].count(2) == 3:
+        #     info(f"Final pose found")
+        #     position_found = True
+        #     azimuth = -self.head_limit
+        #
+        # elif self.label_history[-4:].count(0) == 3:
+        #     info(f"Final pose found")
+        #     position_found = True
+        #     azimuth = self.head_limit
 
-        elif self.label_history[-4:].count(0) == 4:
-            info(f"Final pose found")
-            position_found = True
-
-        return position_found
+        return position_found, azimuth
 
     def getMotorCommand(self, angle_predicted):
 
@@ -320,7 +395,7 @@ class SoundLocalizerModule(yarp.RFModule):
         if angle_predicted == 1:
             elevation_angle = 10.0
 
-        go_angle = self.current_azimuth_angle + (self.head_motion[angle_predicted] / len(self.label_history))
+        go_angle = self.current_azimuth_angle + self.head_motion[angle_predicted] #(self.head_motion[angle_predicted] / len(self.label_history))
 
         if go_angle > self.head_limit:
             go_angle = self.head_limit
@@ -331,6 +406,31 @@ class SoundLocalizerModule(yarp.RFModule):
 
         return go_angle, elevation_angle
 
+    def draw_sound_vis(self, template_img, angle):
+        y = 130
+        x = self.get_pose_angle(angle)
+        color = (255, 255, 255)
+        template_img = cv2.circle(template_img, (x, y), 20, color, -1)
+
+        return template_img
+
+    def get_pose_angle(self, angle):
+        # Put the angle in the range 0-180 degrees
+        bin_angle = int((angle + 89) // 60)
+        bin_angle = bin_angle if bin_angle > 0 else 0
+
+        return bin_angle * 600 + int(600 / 2)
+
+    def write_image_vis(self, frame):
+        """
+            Handle function to stream a visualisation of the sound source detection
+            :param img_array:
+            :return:
+        """
+        self.memory_display_buf_image = yarp.ImageRgb()
+        self.memory_display_buf_image.resize(self.output_img_width, self.output_img_height)
+        self.memory_display_buf_image.setExternal(frame.tobytes(), self.output_img_width, self.output_img_height)
+        self.visualisation_port.write(self.memory_display_buf_image)
 
 if __name__ == '__main__':
 
@@ -345,8 +445,8 @@ if __name__ == '__main__':
 
     rf = yarp.ResourceFinder()
     rf.setVerbose(True)
-    rf.setDefaultContext('soundLocalizer')
-    rf.setDefaultConfigFile('soundLocalizer.ini')
+    rf.setDefaultContext('soundLocaliser')
+    rf.setDefaultConfigFile('soundLocaliser.ini')
 
     if rf.configure(sys.argv):
         soundLocalizer.runModule(rf)

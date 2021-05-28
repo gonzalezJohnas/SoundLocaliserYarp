@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.6)
-set(KEYWORD SoundLocalizer)
 set(NAME_VENV ${KEYWORD}_venv)
 project($KEYWORD)
 
@@ -7,6 +6,9 @@ set(PROGRAM_PERMISSIONS_DEFAULT
         OWNER_WRITE OWNER_READ OWNER_EXECUTE
         GROUP_READ GROUP_EXECUTE
         WORLD_READ WORLD_EXECUTE)
+
+set_property(DIRECTORY PROPERTY ADDITIONAL_MAKE_CLEAN_FILES
+   "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 
 # Find Python and Virtualenv.
 find_program(VIRTUALENV virtualenv)
@@ -43,18 +45,21 @@ add_custom_command(
 add_custom_command(
         OUTPUT binary
         DEPENDS ${NAME_VENV} requirements
-        COMMAND ./${NAME_VENV}/bin/pyinstaller  --onefile ${CMAKE_CURRENT_SOURCE_DIR}/main.py --distpath bin -n KEYWORD
-
+        COMMAND ./${NAME_VENV}/bin/pyinstaller  --onefile ${CMAKE_CURRENT_SOURCE_DIR}/main.py --distpath bin -n ${KEYWORD}
 )
 
 
 # Custom targets for CMake
 # Create a virtual-env and install all requirements
-add_custom_target(build-python  ALL
+add_custom_command(
+        OUTPUT bin/${KEYWORD}
         DEPENDS binary
         SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt
         )
 
-
+add_custom_target(build  ALL
+    DEPENDS binary
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt
+)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/bin/${KEYWORD} PERMISSIONS ${PROGRAM_PERMISSIONS_DEFAULT} DESTINATION bin)
