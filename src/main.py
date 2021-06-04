@@ -52,7 +52,7 @@ class SoundLocalizerModule(yarp.RFModule):
         # Module parameters
         self.model_path = None
         self.model = None
-        self.process = True
+        self.process = False
         self.threshold = None
         self.length_input = None
         self.counter_label = 1
@@ -125,6 +125,10 @@ class SoundLocalizerModule(yarp.RFModule):
         self.path_img_template = rf.check("template_path", yarp.Value("../app/conf/template_img.png"),
                                           'Path of  image template').asString()
 
+        self.threshold_voice = rf.check("voice_threshold",
+                                        yarp.Value(2.5),
+                                        "Energy threshold use by the VAD (int)").asDouble()
+
         # Opening Ports
         # Create handle port to read message
         self.handle_port.open('/' + self.module_name)
@@ -152,9 +156,7 @@ class SoundLocalizerModule(yarp.RFModule):
         self.display_buf_image.setExternal(self.display_buf_array, self.output_img_width,
                                                   self.output_img_height)
 
-        self.threshold_voice = rf.check("voice_threshold",
-                                        yarp.Value("4"),
-                                        "Energy threshold use by the VAD (int)").asDouble()
+
 
         try:
             self.model = tf.keras.models.load_model(self.model_path)
@@ -275,53 +277,54 @@ class SoundLocalizerModule(yarp.RFModule):
 
 
     def updateModule(self):
+        if self.process:
 
-        self.record_audio()
-        audio_power = self.get_power()
+            audio_power = self.get_power()
 
-        if self.process and audio_power > self.threshold_voice:
-            self.audio = self.audio[-1:]
-            self.get_angle_head()
+            if self.record_audio():
+                # self.audio = self.audio[-1:]
+                self.get_angle_head()
 
-            if self.nb_samples_received >= self.length_input * self.sound.getFrequency():
-                audio_signal = format_signal(self.audio)
-                fs = self.sound.getFrequency()
-                wavfile.write("/tmp/recording.wav", fs, audio_signal)
-                # sf.write("/tmp/recording.wav", audio_signal, self.sound.getSamples())
+                if self.nb_samples_received >= self.length_input * self.sound.getFrequency():
+                    audio_signal = format_signal(self.audio)
+                    fs = self.sound.getFrequency()
+                    wavfile.write("/tmp/recording.wav", fs, audio_signal)
+                    # sf.write("/tmp/recording.wav", audio_signal, self.sound.getSamples())
 
-                angle_predicted, score = self.get_sound_source()
+                    angle_predicted, score = self.get_sound_source()
 
-                # Detected a voice
-                if angle_predicted is not None and score > self.threshold:
+                    # Detected a voice
+                    if angle_predicted is not None and score > self.threshold:
 
-                    if angle_predicted == self.previous_label:
-                        self.counter_label += 1
-                    else:
-                        self.counter_label = 1
+                        if angle_predicted == self.previous_label:
+                            self.counter_label += 1
+                        else:
+                            self.counter_label = 1
 
-                    self.previous_label = angle_predicted
-                    self.label_history.append(angle_predicted)
+                        self.previous_label = angle_predicted
+                        self.label_history.append(angle_predicted)
 
-                    has_converged, azimuth = self.inferFinalPose()
+                        has_converged, azimuth = self.inferFinalPose()
 
-                    if has_converged:
-                        self.label_history = []
-                        self.counter_label = 1
-                        # self.process = False
-                        self.sendEvent("sound-localised")
-                        elevation = 10
-                    else:
-                        azimuth, elevation = self.getMotorCommand(angle_predicted)
+                        if has_converged:
+                            self.label_history = []
+                            self.counter_label = 1
+                            # self.process = False
+                            self.sendEvent("sound-localised")
+                            elevation = 10
+                        else:
+                            azimuth, elevation = self.getMotorCommand(angle_predicted)
 
-                    self.send_head_motion(azimuth, elevation)
+                        self.send_head_motion(azimuth, elevation)
 
-                    if self.visualisation_port.getOutputCount():
-                        frame = self.template.copy()
-                        self.output_frame = self.draw_sound_vis(frame, self.head_motion[angle_predicted])
-                        self.write_image_vis(self.output_frame)
+                        if self.visualisation_port.getOutputCount():
+                            frame = self.template.copy()
+                            self.output_frame = self.draw_sound_vis(frame, self.head_motion[angle_predicted])
+                            self.write_image_vis(self.output_frame)
 
-                self.audio = []
-                self.nb_samples_received = 0
+                    self.audio = []
+                    self.nb_samples_received = 0
+
 
         return True
 
