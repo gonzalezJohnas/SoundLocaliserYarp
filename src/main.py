@@ -73,7 +73,7 @@ class SoundLocalizerModule(yarp.RFModule):
 
         # Parameters head motion
         self.head_limit = None
-        self.head_motion = {0: 15, 1: 0, 2: -15}
+        self.head_motion = {0: 25, 1: 0, 2: -25}
 
         # Visualisation
         self.visualisation_port = yarp.Port()
@@ -294,7 +294,8 @@ class SoundLocalizerModule(yarp.RFModule):
                     angle_predicted, score = self.get_sound_source()
 
                     # Detected a voice
-                    if angle_predicted is not None and score > self.threshold:
+                    if angle_predicted is not None and score > self.threshold and audio_power > 0.7:
+                        print(f"Sound source predicted  {SOUND_SOURCE_LABEL_BARRY[angle_predicted]} with {score * 100} % confidence")
 
                         if angle_predicted == self.previous_label:
                             self.counter_label += 1
@@ -313,7 +314,7 @@ class SoundLocalizerModule(yarp.RFModule):
                             self.sendEvent("sound-localised")
                             elevation = 10
                         else:
-                            azimuth, elevation = self.getMotorCommand(angle_predicted)
+                            azimuth, elevation = self.getMotorCommand(angle_predicted, score)
 
                         self.send_head_motion(azimuth, elevation)
 
@@ -321,6 +322,8 @@ class SoundLocalizerModule(yarp.RFModule):
                             frame = self.template.copy()
                             self.output_frame = self.draw_sound_vis(frame, self.head_motion[angle_predicted])
                             self.write_image_vis(self.output_frame)
+                    else:
+                        print("Background")
 
                     self.audio = []
                     self.nb_samples_received = 0
@@ -370,7 +373,6 @@ class SoundLocalizerModule(yarp.RFModule):
             print("Background detected")
             return None, None
 
-        print(f"Sound source predicted  {SOUND_SOURCE_LABEL_BARRY[angle_pred]} with {confidence*100}% confidence")
         return angle_pred, confidence
 
     def inferFinalPose(self):
@@ -392,13 +394,16 @@ class SoundLocalizerModule(yarp.RFModule):
 
         return position_found, azimuth
 
-    def getMotorCommand(self, angle_predicted):
+    def getMotorCommand(self, angle_predicted, score):
 
         elevation_angle = 0.0
         if angle_predicted == 1:
             elevation_angle = 10.0
 
-        go_angle = self.current_azimuth_angle + self.head_motion[angle_predicted] #(self.head_motion[angle_predicted] / len(self.label_history))
+        go_angle = self.current_azimuth_angle + self.head_motion[angle_predicted]  #(self.head_motion[angle_predicted] / len(self.label_history))
+
+        if score > 0.8:
+            go_angle += self.head_motion[angle_predicted] * 2
 
         if go_angle > self.head_limit:
             go_angle = self.head_limit
